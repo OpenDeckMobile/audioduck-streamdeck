@@ -7,16 +7,16 @@ of its keys is on a profile.
 One action, "Ducking": **each key is set up on its own**, and two identical keys do the same thing.
 
 - **Key settings** (`ui/rule.html`): which apps trigger the key, which apps get quieter (or "all the others") and how
-  much, plus its style. Every change is saved at once. Below: apps playing with live levels and volumes, and
+  much ("Reduce by"; saved as `level`, the volume they go down to), plus its style. Every change is saved at once. Below: apps playing with live levels and volumes, and
   the threshold and timings, which are shared by all keys.
 - **Key image** (Foreground Boost's design, `src/keyimage.rs`), top to bottom:
   - the apps whose sound triggers the key, all of them (more than three: the first two and "+n");
-  - a pill with the volume the others go down to (`↓ 20%`), filled while it is ducking, "OFF" when the key is off;
+  - a pill with how much the others go down (`↓ 80%`), filled while it is ducking, "OFF" when the key is off;
   - the apps that go down, dimmed while they are down. "ALL OTHERS" with "all the others"; apps it leaves alone
     are shown crossed out.
 
   Icons come from the running app and are kept in `%APPDATA%\AudioDuck\icons`, so a key shows them while the app
-  is closed. An app never seen running shows a tile with its initial. "Set up" until the key has something to do.
+  is closed. An app never seen running shows AudioDuck's own icon. "Set up" until the key has something to do.
 
   Style per key: Default (stock Stream Deck look) or Duotone (blue, orange, purple, red or custom colours, app icons
   recoloured to match).
