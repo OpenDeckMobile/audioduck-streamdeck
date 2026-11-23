@@ -52,7 +52,7 @@ pub struct Shared {
 
 pub type SharedRef = Arc<Mutex<Shared>>;
 
-fn app_dir() -> PathBuf {
+pub(crate) fn app_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("AudioDuck")
 }
 
