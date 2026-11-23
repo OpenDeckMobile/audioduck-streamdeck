@@ -226,14 +226,22 @@ pub enum State {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 const FONT: &str = r#"font-family="Segoe UI,Arial,sans-serif" font-weight="700""#;
 
-/// Up to three apps side by side, centred, `size` px each, top edge at `y`: their icons, or a tile with the app's
-/// initial while it has never been seen running. More than three show the first two and a "+n" tile. Returns where
-/// each shown app starts.
+/// AudioDuck's own icon (`crate::icon::icon_rgba`: a rounded tile with three equalizer bars) in the key's tones.
+fn duck_icon(p: &mut Vec<String>, t: &Theme, x: f32, y: f32, s: f32, opacity: &str) {
+    p.push(format!(r#"<rect x="{x}" y="{y}" width="{s}" height="{s}" rx="{}" fill="{}" opacity="{opacity}"/>"#, s * 0.25, t.sec));
+    for (bx, h) in [(0.22, 0.31), (0.41, 0.56), (0.59, 0.41)] {
+        p.push(format!(r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{}" fill="{}" opacity="{opacity}"/>"#, x + bx * s, y + (0.5 - h / 2.0) * s, 0.13 * s, h * s, 0.065 * s, t.fg));
+    }
+}
+
+/// Up to three apps side by side, centred, `size` px each, top edge at `y`: their icons, or AudioDuck's own icon while
+/// an app has never been seen running. More than three show the first two and a "+n" tile. Returns where each shown
+/// app starts.
 fn app_row(p: &mut Vec<String>, icons: &mut Icons, t: &Theme, apps: &[String], y: u32, size: u32, opacity: &str) -> Vec<u32> {
     let shown = if apps.len() <= 3 { apps.len() } else { 2 };
     let more = apps.len() - shown;
@@ -248,10 +256,12 @@ fn app_row(p: &mut Vec<String>, icons: &mut Icons, t: &Theme, apps: &[String], y
     let mut starts = Vec::new();
     for app in &apps[..shown] {
         starts.push(x);
+        p.push(format!(r#"<g data-app="{}">"#, esc(app)));
         match icons.png_b64(app, t) {
             Some(png) => p.push(format!(r#"<image x="{x}" y="{y}" width="{size}" height="{size}" opacity="{opacity}" href="data:image/png;base64,{png}"/>"#)),
-            None => tile(p, x, &app.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default()),
+            None => duck_icon(p, t, x as f32, y as f32, size as f32, opacity),
         }
+        p.push("</g>".into());
         x += size + gap;
     }
     if more > 0 {
@@ -324,7 +334,8 @@ fn key_svg(icons: &mut Icons, settings: &Value, state: State, r: &Rule) -> Strin
         p.push(format!(r#"<text x="72" y="80" text-anchor="middle" {FONT} font-size="19" fill="{ink}">OFF</text>"#));
     } else {
         p.push(format!(r#"<path d="M44 64v14m-6-6l6 6 6-6" fill="none" stroke="{ink}" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>"#));
-        p.push(format!(r#"<text x="81" y="80" text-anchor="middle" {FONT} font-size="19" fill="{ink}">{}%</text>"#, (r.level * 100.0).round()));
+        // How much they go down (90 % for a level of 0.1): read with the arrow, a final volume looked like a reduction.
+    p.push(format!(r#"<text x="81" y="80" text-anchor="middle" {FONT} font-size="19" fill="{ink}">{}%</text>"#, ((1.0 - r.level) * 100.0).round()));
     }
     // Bottom: the apps that go down, dimmed while they are down.
     let low = if state == State::Ducking { "0.55" } else { opacity };
@@ -368,18 +379,24 @@ mod tests {
     #[test]
     fn key_shows_every_trigger_above_every_target() {
         let svg = |r: &Rule, state| key_svg(&mut Icons::default(), &json!({}), state, r);
-        // Apps never seen running show as tiles with their initial: sources above the pill, targets below it.
+        // Sources above the pill, targets below it. The pill says how much they go down: 90 % for a level of 0.1.
         let two = svg(&rule(&["qqnoapp.exe", "wwnoapp.exe"], &["zznoapp.exe"], false), State::Listening);
-        let (q, w, pill, z) = (two.find(">Q<").unwrap(), two.find(">W<").unwrap(), two.find(">10%<").unwrap(), two.find(">Z<").unwrap());
-        assert!(q < w && w < pill && pill < z, "{two}");
+        let at = |app: &str| two.find(&format!(r#"data-app="{app}""#)).unwrap();
+        let pill = two.find(">90%<").unwrap();
+        assert!(at("qqnoapp.exe") < at("wwnoapp.exe") && at("wwnoapp.exe") < pill && pill < at("zznoapp.exe"), "{two}");
+        // Apps never seen running show AudioDuck's own icon: a tile and three bars each.
+        assert_eq!(two.matches("<rect").count(), 2 + 3 * 4, "{two}"); // background and pill, then 3 apps
         // Four apps: the first two and "+2".
         let four = svg(&rule(&["anoapp.exe", "bnoapp.exe", "cnoapp.exe", "dnoapp.exe"], &["znoapp.exe"], false), State::Listening);
-        assert!(four.contains(">A<") && four.contains(">B<") && four.contains(">+2<") && !four.contains(">C<"), "{four}");
+        assert!(four.contains(r#"data-app="anoapp.exe""#) && four.contains(r#"data-app="bnoapp.exe""#) && four.contains(">+2<"), "{four}");
+        assert!(!four.contains(r#"data-app="cnoapp.exe""#), "{four}");
+        // A quote in an app name can't break the image.
+        assert!(svg(&rule(&["a\"b.exe"], &[], true), State::Listening).contains(r#"data-app="a&quot;b.exe""#));
         // Everything else, then everything else except one app, crossed out.
         let all = svg(&rule(&["qqnoapp.exe"], &[], true), State::Listening);
         assert!(all.contains(">ALL<") && all.contains(">OTHERS<"), "{all}");
         let except = svg(&rule(&["qqnoapp.exe"], &["zznoapp.exe"], true), State::Listening);
-        assert!(except.contains(">ALL OTHERS<") && except.contains(">Z<") && except.contains("M58 138L86 110"), "{except}");
+        assert!(except.contains(">ALL OTHERS<") && except.contains(r#"data-app="zznoapp.exe""#) && except.contains("M58 138L86 110"), "{except}");
         // Off says so instead of the level; ducking fills the pill.
         let off = svg(&rule(&["qqnoapp.exe"], &[], true), State::Off);
         assert!(off.contains(">OFF<") && !off.contains("%<"), "{off}");

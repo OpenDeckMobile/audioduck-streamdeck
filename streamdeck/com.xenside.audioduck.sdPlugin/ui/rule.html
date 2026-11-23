@@ -196,9 +196,11 @@
 			for (const l of [ed.sources, ed.targets]) if (!l.some(([a]) => a === app)) l.push([app, false]);
 			renderEditor();
 		};
-		const level = el('input', { type: 'range', min: 0, max: 100, value: Math.round(ed.level * 100), style: 'flex:1;min-width:0;width:auto;' });
-		const pct = el('span', { textContent: Math.round(ed.level * 100) + '%', style: 'min-width:3em;' });
-		level.oninput = () => { ed.level = level.value / 100; pct.textContent = level.value + '%'; };
+		// Shown and picked as how much the apps go down; saved as `level`, the volume they go down to.
+		const reduction = Math.round((1 - ed.level) * 100);
+		const level = el('input', { type: 'range', min: 0, max: 100, value: reduction, style: 'flex:1;min-width:0;width:auto;' });
+		const pct = el('span', { textContent: reduction + '%', style: 'min-width:3em;' });
+		level.oninput = () => { ed.level = 1 - level.value / 100; pct.textContent = level.value + '%'; };
 		level.onchange = commit;
 		const levelValue = el('div', { className: 'sdpi-item-value' }, level, pct);
 		$('editor').replaceChildren(
@@ -206,7 +208,7 @@
 			row(ed.all_others ? 'Except' : 'Lower', list(ed.targets), 'checkbox'),
 			row('', el('div', { className: 'sdpi-item-value' }, checkbox(ed.all_others, 'Lower all other apps', (on) => { ed.all_others = on; commit(); })), 'checkbox'),
 			row('Other app', manual),
-			row('Volume', levelValue, 'range'),
+			row('Reduce by', levelValue, 'range'),
 			missing(ed) ? row('', el('div', { className: 'sdpi-item-value note', textContent: missing(ed) })) : '');
 	}
 
