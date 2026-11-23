@@ -1,5 +1,6 @@
 //! Key images in Foreground Boost's design: flat themed tile ("default" Stream Deck look or "duotone" Duotone Essentials
-//! colours), the trigger app's icon > the lowered app's icon on top, and a pill at the bottom with the ducked volume. Drawn as SVG, sent as PNG data URIs.
+//! colours). Top to bottom: the apps that trigger the ducking, a pill with the volume the others go down to, and the
+//! apps that go down. Drawn as SVG, sent as PNG data URIs.
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use windows::Win32::UI::Shell::SHDefExtractIconW;
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 use windows::core::{HSTRING, PWSTR};
 
+use crate::engine::Rule;
 use crate::streamdeck::base64;
 
 const ICON: u32 = 64;
@@ -147,7 +149,35 @@ fn exe_icon(path: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// App icons by exe name, looked up from a running process (an app that isn't running yet is retried every RETRY).
+/// Where an app's icon is kept once seen, so a key can show it while the app isn't running. None for names that
+/// can't be a plain file name (they come from key settings).
+fn cache_path(exe: &str) -> Option<std::path::PathBuf> {
+    let plain = !exe.is_empty() && exe.len() <= 64 && exe.chars().all(|c| c.is_ascii_alphanumeric() || " ._-".contains(c)) && !exe.starts_with('.');
+    plain.then(|| crate::app_dir().join("icons").join(format!("{exe}.png")))
+}
+
+fn load_cached(exe: &str) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(cache_path(exe)?).ok()?;
+    let mut reader = png::Decoder::new(std::io::BufReader::new(file)).read_info().ok()?;
+    let info = reader.info();
+    if (info.width, info.height, info.color_type, info.bit_depth) != (ICON, ICON, png::ColorType::Rgba, png::BitDepth::Eight) {
+        return None;
+    }
+    let mut px = vec![0u8; reader.output_buffer_size()?];
+    reader.next_frame(&mut px).ok()?;
+    Some(px)
+}
+
+fn save_cached(exe: &str, rgba: &[u8]) {
+    let Some(path) = cache_path(exe) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, crate::icon::encode(rgba, ICON));
+}
+
+/// App icons by exe name: from the disk cache, else from a running process (an app that isn't running and was never
+/// seen is retried every RETRY).
 #[derive(Default)]
 pub struct Icons {
     rgba: HashMap<String, Option<Vec<u8>>>,
@@ -162,12 +192,20 @@ impl Icons {
             return Some(p.clone());
         }
         if !self.rgba.contains_key(exe) {
-            if self.tried.get(exe).is_some_and(|t| t.elapsed() < RETRY) {
-                return None;
+            if let Some(px) = load_cached(exe) {
+                self.rgba.insert(exe.to_string(), Some(px));
+            } else {
+                if self.tried.get(exe).is_some_and(|t| t.elapsed() < RETRY) {
+                    return None;
+                }
+                self.tried.insert(exe.to_string(), Instant::now());
+                let pid = crate::audio::processes().into_iter().find(|(_, (n, _))| n == exe)?.0;
+                let px = image_path(pid).and_then(|p| exe_icon(&p));
+                if let Some(px) = &px {
+                    save_cached(exe, px);
+                }
+                self.rgba.insert(exe.to_string(), px);
             }
-            self.tried.insert(exe.to_string(), Instant::now());
-            let pid = crate::audio::processes().into_iter().find(|(_, (n, _))| n == exe)?.0;
-            self.rgba.insert(exe.to_string(), image_path(pid).and_then(|p| exe_icon(&p)));
         }
         let mut px = self.rgba.get(exe)?.clone()?;
         if t.duo {
@@ -193,22 +231,39 @@ fn esc(s: &str) -> String {
 
 const FONT: &str = r#"font-family="Segoe UI,Arial,sans-serif" font-weight="700""#;
 
-/// One app at `x` (48 px wide): its icon, or its name while it hasn't been seen running.
-fn app_slot(p: &mut Vec<String>, icons: &mut Icons, t: &Theme, app: &str, x: u32, opacity: &str) {
-    match icons.png_b64(app, t) {
-        Some(png) => p.push(format!(r#"<image x="{x}" y="22" width="48" height="48" opacity="{opacity}" href="data:image/png;base64,{png}"/>"#)),
-        None => {
-            let mut chars = app.trim_end_matches(".exe").chars().take(6);
-            let name: String = chars.next().into_iter().flat_map(char::to_uppercase).chain(chars).collect();
-            p.push(format!(r#"<text x="{}" y="52" text-anchor="middle" {FONT} font-size="15" fill="{}" opacity="{opacity}">{}</text>"#, x + 24, t.fg, esc(&name)));
+/// Up to three apps side by side, centred, `size` px each, top edge at `y`: their icons, or a tile with the app's
+/// initial while it has never been seen running. More than three show the first two and a "+n" tile. Returns where
+/// each shown app starts.
+fn app_row(p: &mut Vec<String>, icons: &mut Icons, t: &Theme, apps: &[String], y: u32, size: u32, opacity: &str) -> Vec<u32> {
+    let shown = if apps.len() <= 3 { apps.len() } else { 2 };
+    let more = apps.len() - shown;
+    let slots = (shown + usize::from(more > 0)) as u32;
+    let gap = size / 7;
+    let mut x = (144 - (slots * size + slots.saturating_sub(1) * gap)) / 2;
+    let tile = |p: &mut Vec<String>, x: u32, text: &str| {
+        p.push(format!(r#"<rect x="{x}" y="{y}" width="{size}" height="{size}" rx="{}" fill="{}" opacity="{opacity}"/>"#, size / 4, t.sec));
+        let font = if text.chars().count() > 1 { size * 2 / 5 } else { size / 2 };
+        p.push(format!(r#"<text x="{}" y="{}" text-anchor="middle" {FONT} font-size="{font}" fill="{}" opacity="{opacity}">{}</text>"#, x + size / 2, y + size / 2 + font * 7 / 20, t.fg, esc(text)));
+    };
+    let mut starts = Vec::new();
+    for app in &apps[..shown] {
+        starts.push(x);
+        match icons.png_b64(app, t) {
+            Some(png) => p.push(format!(r#"<image x="{x}" y="{y}" width="{size}" height="{size}" opacity="{opacity}" href="data:image/png;base64,{png}"/>"#)),
+            None => tile(p, x, &app.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default()),
         }
+        x += size + gap;
     }
+    if more > 0 {
+        tile(p, x, &format!("+{more}"));
+    }
+    starts
 }
 
-/// `trigger`: the (first) app that triggers ducking; `target`: the (first) app it lowers, None for "all other apps";
-/// `level`: the ducked volume (0..1).
-pub fn key_image(icons: &mut Icons, settings: &Value, state: State, trigger: &str, target: Option<&str>, level: f32) -> String {
-    let svg = key_svg(icons, settings, state, trigger, target, level);
+/// The key for one ducking setup (`r`): the apps whose sound triggers it on top, the volume the others go down to in
+/// the middle, and the apps that go down at the bottom ("all others" with `all_others`, its exceptions crossed out).
+pub fn key_image(icons: &mut Icons, settings: &Value, state: State, r: &Rule) -> String {
+    let svg = key_svg(icons, settings, state, r);
     match to_png(&svg) {
         Some(png) => format!("data:image/png;base64,{}", base64(&png)),
         None => format!("data:image/svg+xml;base64,{}", base64(svg.as_bytes())),
@@ -231,10 +286,8 @@ fn to_png(svg: &str) -> Option<Vec<u8>> {
     pixmap.encode_png().ok()
 }
 
-fn key_svg(icons: &mut Icons, settings: &Value, state: State, trigger: &str, target: Option<&str>, level: f32) -> String {
+fn key_svg(icons: &mut Icons, settings: &Value, state: State, r: &Rule) -> String {
     let t = theme(settings);
-    let lit = matches!(state, State::Listening | State::Ducking);
-    let opacity = if lit { "1" } else { "0.45" };
     let mut p = vec![r#"<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">"#.to_string()];
     p.push(format!(r#"<rect width="144" height="144" fill="{}"/>"#, t.bg));
     if state == State::SetUp {
@@ -243,33 +296,51 @@ fn key_svg(icons: &mut Icons, settings: &Value, state: State, trigger: &str, tar
         for (x, h) in [(46.0, 22.0), (66.0, 40.0), (86.0, 30.0)] {
             p.push(format!(r#"<rect x="{x}" y="{}" width="12" height="{h}" rx="6" fill="{bar}" opacity="0.45"/>"#, 46.0 - h / 2.0));
         }
-    } else {
-        app_slot(&mut p, icons, &t, trigger, 12, opacity);
-        p.push(format!(r#"<path d="M68 38l8 8-8 8" fill="none" stroke="{}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity="{opacity}"/>"#, t.sec));
-        match target {
-            Some(app) => app_slot(&mut p, icons, &t, app, 84, opacity),
-            None => p.push(format!(r#"<text x="108" y="54" text-anchor="middle" {FONT} font-size="20" fill="{}" opacity="{opacity}">All</text>"#, t.fg)),
-        }
+        p.push(format!(r#"<text x="72" y="121" text-anchor="middle" {FONT} font-size="22" fill="{}">Set up</text>"#, t.sec));
+        p.push("</svg>".into());
+        return p.concat();
     }
-    // Fixed-width pill like Foreground Boost: Stream Deck draws Segoe UI wider than browsers, so never size to the text.
+    let off = state == State::Off;
+    let opacity = if off { "0.45" } else { "1" };
+    // Top: the apps whose sound starts the ducking.
+    app_row(&mut p, icons, &t, &r.sources, 10, 40, opacity);
+    // Middle: down to what volume. Fixed width like Foreground Boost's pill: Stream Deck draws Segoe UI wider than
+    // browsers, so never size to the text. Filled while ducking, outlined while waiting, "OFF" when switched off.
     let ink = match state {
-        State::Ducking => &t.bg,
-        State::Listening => &t.fg,
-        _ => &t.sec,
-    };
-    if state == State::Ducking {
-        p.push(format!(r#"<rect x="12" y="95" width="120" height="36" rx="18" fill="{}"/>"#, t.fg));
-    }
-    let label = match state {
-        State::SetUp => "Set up".to_string(),
-        State::Off => "Off".to_string(),
+        State::Ducking => {
+            p.push(format!(r#"<rect x="26" y="57" width="92" height="30" rx="15" fill="{}"/>"#, t.fg));
+            &t.bg
+        }
+        State::Listening => {
+            p.push(format!(r#"<rect x="27.5" y="58.5" width="89" height="27" rx="13.5" fill="none" stroke="{}" stroke-width="3"/>"#, t.sec));
+            &t.fg
+        }
         _ => {
-            p.push(format!(r#"<path d="M26 111l6 7 6-7" fill="none" stroke="{ink}" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>"#));
-            format!("{}%", (level * 100.0).round())
+            p.push(format!(r#"<rect x="27.5" y="58.5" width="89" height="27" rx="13.5" fill="none" stroke="{}" stroke-width="3" opacity="{opacity}"/>"#, t.sec));
+            &t.sec
         }
     };
-    let x = if matches!(state, State::SetUp | State::Off) { 72 } else { 84 };
-    p.push(format!(r#"<text x="{x}" y="121" text-anchor="middle" {FONT} font-size="22" fill="{ink}">{label}</text>"#));
+    if off {
+        p.push(format!(r#"<text x="72" y="80" text-anchor="middle" {FONT} font-size="19" fill="{ink}">OFF</text>"#));
+    } else {
+        p.push(format!(r#"<path d="M44 64v14m-6-6l6 6 6-6" fill="none" stroke="{ink}" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>"#));
+        p.push(format!(r#"<text x="81" y="80" text-anchor="middle" {FONT} font-size="19" fill="{ink}">{}%</text>"#, (r.level * 100.0).round()));
+    }
+    // Bottom: the apps that go down, dimmed while they are down.
+    let low = if state == State::Ducking { "0.55" } else { opacity };
+    if !r.all_others {
+        app_row(&mut p, icons, &t, &r.targets, 95, 40, low);
+    } else if r.targets.is_empty() {
+        p.push(format!(r#"<text x="72" y="111" text-anchor="middle" {FONT} font-size="17" fill="{}" opacity="{low}">ALL</text>"#, t.fg));
+        p.push(format!(r#"<text x="72" y="131" text-anchor="middle" {FONT} font-size="17" fill="{}" opacity="{low}">OTHERS</text>"#, t.fg));
+    } else {
+        // Everything else except these, which are crossed out.
+        p.push(format!(r#"<text x="72" y="107" text-anchor="middle" {FONT} font-size="14" fill="{}" opacity="{low}">ALL OTHERS</text>"#, t.fg));
+        for x in app_row(&mut p, icons, &t, &r.targets, 112, 24, low) {
+            let d = format!("M{} 138L{} 110", x - 2, x + 26);
+            p.push(format!(r#"<path d="{d}" stroke="{}" stroke-width="6" stroke-linecap="round" opacity="{low}"/><path d="{d}" stroke="{}" stroke-width="2.5" stroke-linecap="round" opacity="{low}"/>"#, t.bg, t.fg));
+        }
+    }
     p.push("</svg>".into());
     p.concat()
 }
@@ -289,14 +360,41 @@ mod tests {
         assert_eq!(theme(&json!({ "style": "duotone", "duoPreset": "custom", "duoBg": "bad" })).bg, "#3b4c66"); // falls back to blue
     }
 
+    fn rule(sources: &[&str], targets: &[&str], all_others: bool) -> Rule {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect();
+        Rule { sources: v(sources), targets: v(targets), all_others, level: 0.1, enabled: true }
+    }
+
     #[test]
-    fn key_shows_trigger_then_target() {
-        let svg = |target| key_svg(&mut Icons::default(), &json!({}), State::Listening, "nosuchapp1.exe", target, 0.2);
-        let one = svg(Some("nosuchapp2.exe"));
-        assert!(one.find(">Nosuch<").unwrap() < one.find("M68 38").unwrap() && one.matches(">Nosuch<").count() == 2, "{one}");
-        assert!(svg(None).contains(">All<"));
-        let url = key_image(&mut Icons::default(), &json!({}), State::Listening, "nosuchapp1.exe", None, 0.2);
+    fn key_shows_every_trigger_above_every_target() {
+        let svg = |r: &Rule, state| key_svg(&mut Icons::default(), &json!({}), state, r);
+        // Apps never seen running show as tiles with their initial: sources above the pill, targets below it.
+        let two = svg(&rule(&["qqnoapp.exe", "wwnoapp.exe"], &["zznoapp.exe"], false), State::Listening);
+        let (q, w, pill, z) = (two.find(">Q<").unwrap(), two.find(">W<").unwrap(), two.find(">10%<").unwrap(), two.find(">Z<").unwrap());
+        assert!(q < w && w < pill && pill < z, "{two}");
+        // Four apps: the first two and "+2".
+        let four = svg(&rule(&["anoapp.exe", "bnoapp.exe", "cnoapp.exe", "dnoapp.exe"], &["znoapp.exe"], false), State::Listening);
+        assert!(four.contains(">A<") && four.contains(">B<") && four.contains(">+2<") && !four.contains(">C<"), "{four}");
+        // Everything else, then everything else except one app, crossed out.
+        let all = svg(&rule(&["qqnoapp.exe"], &[], true), State::Listening);
+        assert!(all.contains(">ALL<") && all.contains(">OTHERS<"), "{all}");
+        let except = svg(&rule(&["qqnoapp.exe"], &["zznoapp.exe"], true), State::Listening);
+        assert!(except.contains(">ALL OTHERS<") && except.contains(">Z<") && except.contains("M58 138L86 110"), "{except}");
+        // Off says so instead of the level; ducking fills the pill.
+        let off = svg(&rule(&["qqnoapp.exe"], &[], true), State::Off);
+        assert!(off.contains(">OFF<") && !off.contains("%<"), "{off}");
+        let ducking = svg(&rule(&["qqnoapp.exe"], &[], true), State::Ducking);
+        assert!(ducking.contains(r#"<rect x="26" y="57" width="92" height="30" rx="15""#), "{ducking}");
+        let url = key_image(&mut Icons::default(), &json!({}), State::Listening, &rule(&["qqnoapp.exe"], &[], true));
         assert!(url.starts_with("data:image/png;base64,"), "{url:.40}");
+    }
+
+    #[test]
+    fn cached_icons_only_under_plain_names() {
+        assert!(cache_path("discord.exe").is_some_and(|p| p.ends_with(r"icons\discord.exe.png")));
+        for bad in [r"..\x.exe", "a/b.exe", "", ".hidden", "c:x.exe"] {
+            assert!(cache_path(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

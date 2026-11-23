@@ -76,8 +76,7 @@ fn image(shared: &SharedRef, icons: &mut Icons, settings: &Value) -> String {
     } else {
         State::Listening
     };
-    let target = if r.all_others { None } else { Some(r.targets.first().map_or("", |s| s)) };
-    key_image(icons, settings, state, r.sources.first().map_or("", |s| s), target, r.level)
+    key_image(icons, settings, state, &r)
 }
 
 fn set_config(shared: &SharedRef, change: impl FnOnce(&mut Config)) {
